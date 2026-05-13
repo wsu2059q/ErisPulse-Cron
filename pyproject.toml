@@ -1,0 +1,19 @@
+[project]
+name = "ErisPulse-Cron"
+version = "1.0.0"
+description = "ErisPulse 定时任务调度模块 - 支持一次性/间隔/Cron定时，回调传参，SQLite持久化"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [ { name = "wsu2059q" } ]
+dependencies = [
+    "croniter>=1.3.0",
+]
+
+[project.urls]
+"homepage" = "https://github.com/wsu2059q/ErisPulse-Cron"
+
+[project.entry-points."erispulse.module"]
+"Cron" = "Cron:Main"
+
+[tool.setuptools]
+packages = ["Cron"]
