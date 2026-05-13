@@ -13,7 +13,7 @@ ErisPulse 定时任务调度模块，为其他模块提供统一的定时任务 
 ## 安装
 
 ```bash
-epsdk install ErisPulse-Cron
+epsdk install Cron
 ```
 
 > 依赖 ErisPulse >= 2.4.4
