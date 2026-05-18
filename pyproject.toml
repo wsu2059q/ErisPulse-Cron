@@ -1,6 +1,6 @@
 [project]
 name = "ErisPulse-Cron"
-version = "1.0.0"
+version = "1.0.1"
 description = "ErisPulse 定时任务调度模块 - 支持一次性/间隔/Cron定时，回调传参，SQLite持久化"
 requires-python = ">=3.10"
 license = { text = "MIT" }

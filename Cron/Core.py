@@ -1,5 +1,11 @@
+import asyncio
+import io
+import json
+import os
 import time
+from contextlib import redirect_stderr, redirect_stdout
 from typing import Any, Awaitable, Callable, Dict, List, Optional
+from urllib.request import Request as UrlRequest, urlopen
 
 from ErisPulse import sdk
 from ErisPulse.Core.Bases import BaseModule
@@ -15,6 +21,8 @@ class Main(BaseModule):
         self.logger = sdk.logger.get_child("Cron")
         self._store: Optional[Store] = None
         self._scheduler: Optional[Scheduler] = None
+        self._dashboard: Optional[object] = None
+        self._builtin_handler: Optional[TriggerHandler] = None
 
     @staticmethod
     def get_load_strategy():
@@ -31,9 +39,22 @@ class Main(BaseModule):
         self._store = Store()
         self._scheduler = Scheduler(self._store)
         await self._scheduler.start()
+
+        self._register_builtin_actions()
+
+        from .dashboard import DashboardIntegration
+        self._dashboard = DashboardIntegration(self)
+        self._dashboard.setup()
+
         self.logger.info("Cron module loaded")
 
     async def on_unload(self, event):
+        if self._dashboard:
+            self._dashboard.teardown()
+            self._dashboard = None
+        if self._builtin_handler:
+            self.off_trigger(self._builtin_handler)
+            self._builtin_handler = None
         if self._scheduler:
             await self._scheduler.stop()
         self.logger.info("Cron module unloaded")
@@ -195,3 +216,131 @@ class Main(BaseModule):
     def cleanup(self, max_age_seconds: float = 86400 * 7) -> int:
         self._ensure_initialized()
         return self._store.cleanup_completed(max_age_seconds)
+
+    # ==================== Built-in Actions ====================
+
+    def _register_builtin_actions(self):
+        async def _builtin_handler(trigger_info: dict):
+            cb = trigger_info.get("callback_data")
+            if not isinstance(cb, dict):
+                return
+            action = cb.get("__cron_action")
+            if not action:
+                return
+
+            task_id = trigger_info.get("task_id", "?")
+            try:
+                if action == "shell":
+                    await self._action_shell(cb, task_id)
+                elif action == "python":
+                    await self._action_python(cb, task_id)
+                elif action == "http":
+                    await self._action_http(cb, task_id)
+                elif action == "message":
+                    await self._action_message(cb, task_id)
+                else:
+                    self.logger.warning(f"Unknown builtin action '{action}' for task {task_id}")
+            except Exception as e:
+                self.logger.error(f"Builtin action '{action}' failed for task {task_id}: {e}")
+
+        self._builtin_handler = _builtin_handler
+        self.on_trigger(_builtin_handler)
+
+    async def _action_shell(self, data: dict, task_id: str):
+        command = data.get("command", "")
+        if not command:
+            return
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+            self.logger.info(
+                f"[shell] task={task_id[:8]} exit={proc.returncode} "
+                f"stdout={stdout[:200].decode(errors='replace')}"
+            )
+            if proc.returncode != 0:
+                self.logger.warning(
+                    f"[shell] task={task_id[:8]} stderr={stderr[:200].decode(errors='replace')}"
+                )
+        except asyncio.TimeoutError:
+            self.logger.error(f"[shell] task={task_id[:8]} timed out (300s)")
+        except Exception as e:
+            self.logger.error(f"[shell] task={task_id[:8]} error: {e}")
+
+    async def _action_python(self, data: dict, task_id: str):
+        code = data.get("code", "")
+        if not code:
+            return
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        sandbox = {
+            "__builtins__": __builtins__,
+            "sdk": self.sdk,
+            "asyncio": asyncio,
+            "json": json,
+            "os": os,
+            "time": time,
+        }
+        try:
+            with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
+                exec(code, sandbox)
+            out = stdout_buf.getvalue()
+            if out:
+                self.logger.info(f"[python] task={task_id[:8]} output: {out[:300]}")
+        except Exception as e:
+            err = stderr_buf.getvalue()
+            self.logger.error(f"[python] task={task_id[:8]} error: {e} {err[:200]}")
+
+    async def _action_http(self, data: dict, task_id: str):
+        url = data.get("url", "")
+        method = data.get("method", "GET").upper()
+        headers = data.get("headers", {})
+        body = data.get("body")
+
+        if not url:
+            return
+
+        try:
+            body_bytes = None
+            if body is not None:
+                body_bytes = json.dumps(body).encode() if not isinstance(body, (bytes, str)) else (
+                    body.encode() if isinstance(body, str) else body
+                )
+
+            req = UrlRequest(url, data=body_bytes, method=method)
+            for k, v in headers.items():
+                req.add_header(k, v)
+            if body is not None and "Content-Type" not in headers:
+                req.add_header("Content-Type", "application/json")
+
+            loop = asyncio.get_event_loop()
+            resp = await loop.run_in_executor(None, lambda: urlopen(req, timeout=30))
+            status = resp.getcode()
+            resp_data = resp.read(1024)
+            self.logger.info(f"[http] task={task_id[:8]} {method} {url} -> {status}")
+        except Exception as e:
+            self.logger.error(f"[http] task={task_id[:8]} {method} {url} error: {e}")
+
+    async def _action_message(self, data: dict, task_id: str):
+        platform = data.get("platform", "")
+        session_type = data.get("session_type", "user")
+        target_id = data.get("target_id", "")
+        message = data.get("message", "")
+
+        if not platform or not target_id or not message:
+            return
+
+        try:
+            adapter = self.sdk.adapter.get(platform)
+            if adapter is None:
+                self.logger.error(f"[message] task={task_id[:8]} adapter '{platform}' not found")
+                return
+            await adapter.Send.To(session_type, str(target_id)).Text(str(message))
+            self.logger.info(
+                f"[message] task={task_id[:8]} sent to {platform}/{session_type}/{target_id}"
+            )
+        except Exception as e:
+            self.logger.error(f"[message] task={task_id[:8]} error: {e}")
